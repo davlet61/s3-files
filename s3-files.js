@@ -1,81 +1,73 @@
-var Stream = require('stream')
-var AWS = require('aws-sdk')
-var streamify = require('stream-array')
-var concat = require('concat-stream')
-var path = require('path')
+const { Readable } = require('stream')
+const streamify = require('stream-array')
+const concat = require('concat-stream')
+const path = require('path')
+const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3')
 
-var s3Files = {}
+const s3Files = {}
 module.exports = s3Files
 
 s3Files.connect = function (opts) {
-  var self = this
-
   if ('s3' in opts) {
-    self.s3 = opts.s3
+    this.s3 = opts.s3
   } else {
-    AWS.config.update({
+    const s3Client = new S3Client({
       region: opts.region
     })
-    self.s3 = new AWS.S3()
+    this.s3 = s3Client
   }
-
-  self.bucket = opts.bucket
-  return self
+  this.bucket = opts.bucket
+  return this
 }
 
 s3Files.createKeyStream = function (folder, keys) {
   if (!keys) return null
-  var paths = []
-  keys.forEach(function (key) {
-    if (folder) {
-      paths.push(path.posix.join(folder, key))
-    } else {
-      paths.push(key)
-    }
-  })
+  const paths = keys.map((key) =>
+    folder ? path.posix.join(folder, key) : key
+  )
   return streamify(paths)
 }
 
-s3Files.createFileStream = function (keyStream, preserveFolderPath) {
-  var self = this
-  if (!self.bucket) return null
+s3Files.createFileStream = async function (keyStream, preserveFolderPath) {
+  if (!this.bucket) return null
 
-  var rs = new Stream()
-  rs.readable = true
+  const rs = new Readable({ objectMode: true })
 
-  var fileCounter = 0
-  keyStream.on('data', function (file) {
+  let fileCounter = 0
+  keyStream.on('data', async (file) => {
     fileCounter += 1
     if (fileCounter > 5) {
-      keyStream.pause() // we add some 'throttling' there
+      keyStream.pause()
     }
 
-    // console.log('->file', file);
-    var params = { Bucket: self.bucket, Key: file }
-    var s3File = self.s3.getObject(params).createReadStream()
+    const params = { Bucket: this.bucket, Key: file }
+    try {
+      const s3FileStream = await this.s3.send(new GetObjectCommand(params))
+      const s3File = s3FileStream.Body
 
-    s3File.pipe(
-      concat(function buffersEmit (buffer) {
-        // console.log('buffers concatenated, emit data for ', file);
-        var path = preserveFolderPath ? file : file.replace(/^.*[\\/]/, '')
-        rs.emit('data', { data: buffer, path: path })
+      s3File.pipe(
+        concat((buffer) => {
+          const filePath = preserveFolderPath
+            ? file
+            : file.replace(/^.*[\\/]/, '')
+          rs.push({ data: buffer, path: filePath })
+        })
+      )
+
+      s3File.on('end', () => {
+        fileCounter -= 1
+        if (keyStream.isPaused()) {
+          keyStream.resume()
+        }
+        if (fileCounter < 1) {
+          rs.push(null)
+        }
       })
-    )
-    s3File.on('end', function () {
-      fileCounter -= 1
-      if (keyStream.isPaused()) {
-        keyStream.resume()
-      }
-      if (fileCounter < 1) {
-        // console.log('all files processed, emit end');
-        rs.emit('end')
-      }
-    })
-
-    s3File.on('error', function (err) {
+    } catch (err) {
       err.file = file
       rs.emit('error', err)
-    })
+    }
   })
+
   return rs
 }
